@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Spray run artifacts (never commit loot / logs)
+spray_*.log
+*.valid.txt
+*.pwned.txt
+valid.txt
+pwned.txt
+results.csv
+loot/
+*.report.md

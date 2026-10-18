@@ -1,0 +1,9 @@
+# netexecspray core is pure stdlib — no required pip packages.
+#
+# External runtime dependency (install separately, not via pip):
+#   nxc  — NetExec, provides the smb/ldap/winrm/... backends
+#          https://github.com/Pennyw0rth/NetExec
+#
+# Optional: only for the native MySQL sprayer (mysql / db bundle).
+# Install with:  pip install netexecspray[mysql]   (or: pip install PyMySQL)
+# PyMySQL>=1.0

@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "netexecspray"
+version = "2.0.0"
+description = "Modern multi-protocol NetExec password sprayer with native mail/db sprayers, lockout-aware pacing, and ready-to-use loot output."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { file = "LICENSE" }
+keywords = ["netexec", "nxc", "password-spray", "pentest", "red-team", "active-directory"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: Information Technology",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+]
+
+# Core sprayer is pure stdlib; nxc is an external CLI dependency (not a pip pkg).
+dependencies = []
+
+[project.optional-dependencies]
+# Only needed for the native MySQL sprayer (`mysql` / `db` bundle).
+mysql = ["PyMySQL>=1.0"]
+
+[project.scripts]
+netexecspray = "netexecspray.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/zingerw1/netexecsprayer"
+
+[tool.setuptools]
+# Ship the package only; the top-level netexecspray.py shim is replaced by the
+# console entry point above, so it must not be installed as a conflicting module.
+packages = ["netexecspray"]
