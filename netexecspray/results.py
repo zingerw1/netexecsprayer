@@ -44,6 +44,16 @@ def log_write(logfile, text):
             f.write(ANSI.sub("", text).rstrip() + "\n")
 
 
+def log_escape(s):
+    """Escape a space as "%20" in a fixed-width log column. _RESUME_RE (and
+    any plain split-on-whitespace reader) captures a field as \\S+ — a
+    literal space inside `user` or `secret_display` would otherwise truncate
+    that field right there, corrupting resume's reconstructed dedup key (and
+    silently defeating --resume for that credential). loaders.py's
+    log_unescape() reverses this before using either field."""
+    return s.replace(" ", "%20")
+
+
 def log_attempt(logfile, status, proto, target, user, secret_display, detail="", ts=None):
     """Write one aligned, timestamped line describing a single attempt."""
     if not logfile:
@@ -55,7 +65,7 @@ def log_attempt(logfile, status, proto, target, user, secret_display, detail="",
     if len(detail) > 60:
         detail = detail[:59] + "…"
     log_write(logfile, f"  {ts}  {tag:<9} {proto:<6} {target:<16} "
-                       f"{user:<18} {secret_display:<22} {detail}")
+                       f"{log_escape(user):<18} {log_escape(secret_display):<22} {detail}")
 
 
 def log_header(logfile, started, protocols, targets, users, secret_kind, total, cmd):
@@ -115,8 +125,14 @@ def log_summary(logfile, results, attempts, done_n, elapsed, rate, finished, abo
 
 # ── Record pipeline ───────────────────────────────────────────────────────────
 def record_result(logfile, status, proto, target, user, secret_display,
-                  detail="", output=""):
-    """Store a structured record, bucket it, and write the clean log line."""
+                  detail="", output="", secret_real=None):
+    """Store a structured record, bucket it, and write the clean log line.
+
+    `secret_display` is what's shown/logged on the terminal and in the plain
+    log file (masked, e.g. "(hash:31d6cfe0…)"). `secret_real` — when given,
+    for confirmed hits — is the actual plaintext/hash, used by the loot/CSV/
+    JSON/report exporters so a successful credential is actually reusable.
+    """
     rec = {
         "ts":     datetime.now().strftime("%H:%M:%S"),
         "status": status,
@@ -124,6 +140,7 @@ def record_result(logfile, status, proto, target, user, secret_display,
         "target": target,
         "user":   user,
         "secret": secret_display,
+        "secret_full": secret_real if secret_real is not None else secret_display,
         "detail": ANSI.sub("", detail).replace("\n", " ").strip(),
         "host":   banner(output),
     }
@@ -164,13 +181,13 @@ def write_loot(valid_path, pwned_path, results):
     """valid.txt = user:secret (deduped); pwned.txt = proto target user:secret."""
     seen, valid_lines = set(), []
     for r in results["access"] + results["valid"]:
-        pair = f"{r['user']}:{r['secret']}"
+        pair = f"{r['user']}:{r.get('secret_full', r['secret'])}"
         if pair not in seen:
             seen.add(pair)
             valid_lines.append(pair)
     Path(valid_path).write_text("\n".join(valid_lines) + ("\n" if valid_lines else ""))
 
-    pwned_lines = [f"{r['proto']} {r['target']} {r['user']}:{r['secret']}"
+    pwned_lines = [f"{r['proto']} {r['target']} {r['user']}:{r.get('secret_full', r['secret'])}"
                    for r in results["access"]]
     Path(pwned_path).write_text("\n".join(pwned_lines) + ("\n" if pwned_lines else ""))
 
@@ -181,16 +198,22 @@ def write_csv(csv_path, attempts):
         w.writerow(["time", "status", "proto", "target", "user", "secret", "host", "detail"])
         for r in attempts:
             w.writerow([r["ts"], r["status"], r["proto"], r["target"],
-                        r["user"], r["secret"], r.get("host", ""), r["detail"]])
+                        r["user"], r.get("secret_full", r["secret"]), r.get("host", ""), r["detail"]])
 
 
 def write_report(path, meta, results, attempts, elapsed, aborted=False):
     """A tidy Markdown engagement report."""
+    def esc(cell):
+        # a sprayed secret/detail can contain '|' or a newline — either
+        # would otherwise split into extra columns or break the row
+        # entirely when the .md report is rendered as a table.
+        return str(cell).replace("|", "\\|").replace("\n", " ")
+
     def table(headers, rows):
         out = ["| " + " | ".join(headers) + " |",
                "| " + " | ".join("---" for _ in headers) + " |"]
         for row in rows:
-            out.append("| " + " | ".join(str(c) for c in row) + " |")
+            out.append("| " + " | ".join(esc(c) for c in row) + " |")
         return "\n".join(out)
 
     acc, val = results["access"], results["valid"]
@@ -215,7 +238,7 @@ def write_report(path, meta, results, attempts, elapsed, aborted=False):
         md += ["## Findings", "",
                table(["Status", "Proto", "Target", "User", "Secret", "Detail"],
                      [[("ACCESS" if r in acc else "valid"), r["proto"], r["target"],
-                       r["user"], r["secret"], r["detail"]] for r in acc + val]), ""]
+                       r["user"], r.get("secret_full", r["secret"]), r["detail"]] for r in acc + val]), ""]
     else:
         md += ["## Findings", "", "_No valid credentials found._", ""]
 

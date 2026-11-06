@@ -20,6 +20,7 @@ locked_lock   = threading.Lock()   # guards `locked_users`
 user_att_lock = threading.Lock()   # guards `user_attempts`
 active_lock   = threading.Lock()   # guards `active`
 rate_lock     = threading.Lock()   # guards `rate_state`
+port_lock     = threading.Lock()   # guards `port_cache`
 
 # ── Results ─────────────────────────────────────────────────────────────────
 # Every attempt lands in `attempts`; the buckets in `results` hold the SAME dict
@@ -28,13 +29,19 @@ attempts      = []
 results       = {"access": [], "valid": [], "locked": [], "errors": []}
 
 # ── Dedupe / progress ─────────────────────────────────────────────────────────
-seen          = set()                 # proto:target:user:secret already attempted
+seen          = set()                 # proto:target:user:H|P:secret already attempted
 counter       = {"done": 0, "total": 0}
 locked_users  = set()                 # accounts observed locked → skipped
 user_attempts = {}                    # user → attempts made (for --max-attempts)
 active        = {}                    # thread id → "proto user@target"
 rate_state    = {"next": 0.0}         # token-bucket cursor for --rate
 rate_hist     = []                    # recent attempts/sec samples (status sparkline)
+port_cache    = {}                    # (host, port) → bool, so N users against the same
+                                       # closed/open native-protocol port don't each pay
+                                       # their own TCP probe
+port_probe_locks = {}                  # (host, port) → Lock, so concurrent first-time
+                                       # lookups of the same port serialise onto one real
+                                       # probe instead of each paying the full timeout
 
 # ── Lifecycle flags ─────────────────────────────────────────────────────────
 start_time    = 0.0                   # set when the spray loop begins

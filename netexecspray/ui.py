@@ -74,16 +74,29 @@ def render_bar(done, total, width=14):
 
 
 def tally():
-    """Minimal live counter: › N valid  ✦ N admin (only what matters)."""
+    """Minimal live counter: › N valid  ✦ N admin (only what matters) — plus a
+    per-protocol breakdown once more than one protocol has actually produced a
+    hit (e.g. spraying the `all`/`ad` bundle), so you're not left guessing
+    which of 17 protocols the stream already scrolled past."""
     with state.results_lock:
-        a = len(state.results["access"])
-        v = len(state.results["valid"])
+        access = list(state.results["access"])
+        valid  = list(state.results["valid"])
+    a, v = len(access), len(valid)
     nval = a + v
     if not nval:
         return ""
     s = f"{CYAN}{G_HIT} {nval} valid{RESET}"
     if a:
         s += f"  {WHITE}{G_OK} {a} admin{RESET}"
+
+    by_proto = {}
+    for r in access + valid:
+        by_proto[r["proto"]] = by_proto.get(r["proto"], 0) + 1
+    if len(by_proto) > 1:
+        parts = sorted(by_proto.items(), key=lambda kv: -kv[1])
+        shown = parts[:3]
+        more  = f" +{len(parts) - 3}" if len(parts) > 3 else ""
+        s += f"  {GRAY}({' '.join(f'{p}×{n}' for p, n in shown)}{more}){RESET}"
     return s
 
 
@@ -138,8 +151,29 @@ def redraw_unsafe():
         sys.stdout.flush()
 
 
+_last_redraw = [0.0]
+_REDRAW_MIN_INTERVAL = 1 / 20   # 20Hz ceiling
+
+
 def redraw():
+    """Nudge the status bar. The ticker thread already repaints it continuously
+    (~14Hz); callers that just finished a job (high thread counts → many of
+    these landing at once) only need to nudge it, not force an extra terminal
+    write on top of every single one — hence the throttle below. A line
+    printed via cprint() calls redraw_unsafe() directly instead, under the
+    print_lock it's already holding, bypassing this throttle so the bar never
+    flashes stale right after real output.
+
+    The throttle's read-then-write check happens under print_lock (not just
+    the write below it) — otherwise many worker threads landing in the same
+    ~50ms window can all read the stale timestamp before any of them writes
+    it back, each passing the check and repainting concurrently, which is
+    exactly the redundant-write pile-up this throttle exists to prevent."""
     with state.print_lock:
+        now = time.time()
+        if now - _last_redraw[0] < _REDRAW_MIN_INTERVAL:
+            return
+        _last_redraw[0] = now
         redraw_unsafe()
 
 

@@ -7,7 +7,24 @@ NXC_PROTOCOLS = ["smb", "ldap", "winrm", "ssh", "ftp", "mssql", "rdp", "wmi", "v
 # native Python sprayers (see runners.py)
 NATIVE_PROTOCOLS = ["smtp", "smtps", "imap", "imaps", "pop3", "pop3s", "mysql"]
 
+# nxc-backed protocols that actually implement Kerberos auth (nxc 1.5.x).
+# -k/--kdcHost appear in every nxc protocol's --help, but ssh/ftp/vnc/nfs have
+# no kerberos_login at all (nxc even rejects -d as an unrecognized argument
+# for them), and winrm's module is NTLM-only despite exposing the flags.
+KERBEROS_PROTOCOLS = ["smb", "ldap", "mssql", "wmi", "rdp"]
+
 ALL_PROTOCOLS = NXC_PROTOCOLS + NATIVE_PROTOCOLS
+
+# protocols validate_access() actually knows how to double-check (runners.py).
+# ssh/ftp/vnc/rdp/nfs have no branch there, so calling it for them never makes
+# a real second request — it just falls through to "No secondary confirmation".
+VALIDATE_IMPLEMENTED = ["smb", "winrm", "wmi", "ldap", "mssql"]
+
+# protocols whose nxc module actually accepts --local-auth (checked against
+# `nxc <proto> --help` for every NXC_PROTOCOLS entry). ldap/ssh/ftp/vnc/nfs
+# don't have the flag at all — passing it blows up with an argparse error that
+# gets misread as "protocol not supported by this nxc build".
+LOCAL_AUTH_PROTOCOLS = ["smb", "winrm", "mssql", "wmi", "rdp"]
 
 # Default service port(s) per protocol — reference for --list-protocols and docs.
 PORTS = {
