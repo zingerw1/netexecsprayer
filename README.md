@@ -1,10 +1,5 @@
 # netexecspray
 
-A multi-protocol password sprayer wrapping **NetExec (`nxc`)**, with native
-Python sprayers for mail/db services, lockout-aware pacing, and a live UI.
-
-Based on [netexecspray](https://github.com/I-AlanF90/netexecspray) by I-AlanF90.
-
 > **Authorized security testing only.** Run this only against systems you own
 > or are explicitly authorized to test.
 
