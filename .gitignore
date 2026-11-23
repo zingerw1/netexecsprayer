@@ -16,3 +16,10 @@ pwned.txt
 results.csv
 loot/
 *.report.md
+
+# Editors / tooling
+.idea/
+.vscode/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
