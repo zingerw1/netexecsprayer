@@ -13,6 +13,8 @@ pip install .                 # or: pip install '.[mysql]' for native mysql
 
 Requires Python 3.8+ and `nxc` in `PATH`.
 
+Update with `git pull && pip install .`, remove with `pip uninstall netexecspray`.
+
 ## Usage
 
 ```bash
